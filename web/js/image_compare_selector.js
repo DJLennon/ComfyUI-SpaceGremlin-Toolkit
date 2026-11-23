@@ -222,8 +222,8 @@ app.registerExtension({
                 const { orig_filename, enh_filename } = event.detail;
                 const timestamp = Date.now();
 
-                imgOrig.src = `/view?filename=${orig_filename}&type=temp&t=${timestamp}`;
-                imgEnhanced.src = `/view?filename=${enh_filename}&type=temp&t=${timestamp}`;
+                imgOrig.src = `/view?filename=${encodeURIComponent(orig_filename)}&type=temp&t=${timestamp}`;
+                imgEnhanced.src = `/view?filename=${encodeURIComponent(enh_filename)}&type=temp&t=${timestamp}`;
             }
         };
 

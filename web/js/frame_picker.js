@@ -353,7 +353,7 @@ app.registerExtension({
             fsSlider.min = 0;
             fsSlider.max = totalFrames - 1;
 
-            gridImgUrl = `/view?filename=${detail.grid_filename}&type=temp&t=${Date.now()}`;
+            gridImgUrl = `/view?filename=${encodeURIComponent(detail.grid_filename)}&type=temp&t=${Date.now()}`;
 
             loadedImage = new Image();
             loadedImage.onload = () => {
@@ -370,7 +370,7 @@ app.registerExtension({
 
         const checkForWaitingState = async () => {
             try {
-                const res = await api.fetchApi(`/image_compare/status?node_id=${node.id}`);
+                const res = await api.fetchApi(`/image_compare/status?node_id=${encodeURIComponent(node.id)}`);
                 if (res.ok) {
                     const data = await res.json();
                     if (data.waiting && data.data) {
