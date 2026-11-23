@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont
 import folder_paths
 from server import PromptServer
 from aiohttp import web
-from comfy.model_management import InterruptProcessingException
+from comfy.model_management import InterruptProcessingException, throw_exception_if_processing_interrupted
 import json
 from comfy_api.latest import io
 import torch.nn.functional as F
@@ -17,8 +17,24 @@ DEFAULT_ENUM_DEFINITION = """OPTION_A
 OPTION_B"""
 DEFAULT_CHOICES = ["OPTION_A", "OPTION_B"]
 
-WAITING_DATA = {} 
+WAITING_DATA = {}
 WAITING_SELECTIONS = {}
+
+
+def _temp_filename(prefix, node_id, ext):
+    # node_id comes from the prompt keys, which are not validated: keep it out of the path.
+    return f"{prefix}_{re.sub(r'[^A-Za-z0-9_-]', '_', node_id)}.{ext}"
+
+
+def _wait_for_selection(node_id):
+    try:
+        while WAITING_SELECTIONS.get(node_id) is None:
+            throw_exception_if_processing_interrupted()
+            time.sleep(0.1)
+        return WAITING_SELECTIONS[node_id]
+    finally:
+        WAITING_SELECTIONS.pop(node_id, None)
+        WAITING_DATA.pop(node_id, None)
 
 class EnumTextSelector:
     @classmethod
@@ -256,6 +272,9 @@ async def receive_selection(request):
     node_id = json_data.get("node_id")
     choice = json_data.get("choice")
 
+    if not isinstance(choice, (str, dict)):
+        return web.json_response({"status": "error", "message": "Invalid choice"}, status=400)
+
     if node_id in WAITING_SELECTIONS:
         WAITING_SELECTIONS[node_id] = choice
         WAITING_DATA.pop(node_id, None)  # Nettoyage au déblocage
@@ -338,8 +357,8 @@ class ImageCompareSelector:
 
         # Preview de sécurité
         temp_dir = folder_paths.get_temp_directory()
-        orig_filename = f"cmp_orig_{node_id}.png"
-        enh_filename = f"cmp_enh_{node_id}.png"
+        orig_filename = _temp_filename("cmp_orig", node_id, "png")
+        enh_filename = _temp_filename("cmp_enh", node_id, "png")
 
         preview_orig = orig_list[0] if len(orig_list) > 0 else torch.zeros((1, 64, 64, 3))
         preview_enh = enh_list[0] if len(enh_list) > 0 else torch.zeros((1, 64, 64, 3))
@@ -356,10 +375,7 @@ class ImageCompareSelector:
             "enh_filename": enh_filename
         })
 
-        while WAITING_SELECTIONS.get(node_id) is None:
-            time.sleep(0.1)
-
-        selection = WAITING_SELECTIONS.pop(node_id, "cancel")
+        selection = _wait_for_selection(node_id)
 
         # 1. Traitement images principales
         if selection == "original":
@@ -428,11 +444,7 @@ class PauseControl:
             "node_id": node_id
         })
 
-        # Boucle d'attente générique
-        while WAITING_SELECTIONS.get(node_id) is None:
-            time.sleep(0.1)
-
-        selection = WAITING_SELECTIONS.pop(node_id, "cancel")
+        selection = _wait_for_selection(node_id)
 
         if selection == "continue":
             return (any1, any2)
@@ -485,6 +497,21 @@ class SpaceGremlinFramePicker:
         grid_h = rows * thumb_h
         grid_img = Image.new("RGB", (grid_w, grid_h), (20, 20, 20))
 
+        # TODO: remove once the source of the NaN/inf frames is found.
+        finite = torch.isfinite(images)
+        if not finite.all():
+            bad_per_frame = (~finite).flatten(1).sum(1).tolist()
+            bad_frames = [i for i, n in enumerate(bad_per_frame) if n > 0]
+            nan_count = torch.isnan(images).sum().item()
+            inf_count = torch.isinf(images).sum().item()
+            finite_vals = images[finite]
+            value_range = f"{finite_vals.min().item():.4f}..{finite_vals.max().item():.4f}" if finite_vals.numel() > 0 else "none"
+            print(f"[SpaceGremlinFramePicker] node {node_id}: non-finite pixels in {len(bad_frames)}/{total_frames} frames "
+                  f"(shape {tuple(images.shape)}, {images.dtype}, {images.device}); NaN={nan_count} inf={inf_count}; "
+                  f"finite range {value_range}")
+            print(f"[SpaceGremlinFramePicker] bad frames (index: count of {images[0].numel()} values): "
+                  + ", ".join(f"{i}: {bad_per_frame[i]}" for i in bad_frames))
+
         for idx in range(total_frames):
             img_np = (images[idx].cpu().numpy() * 255).astype(np.uint8)
             pil_img = Image.fromarray(img_np)
@@ -495,7 +522,7 @@ class SpaceGremlinFramePicker:
             grid_img.paste(pil_img, (c * thumb_w, r * thumb_h))
 
         temp_dir = folder_paths.get_temp_directory()
-        grid_filename = f"frame_picker_grid_{node_id}.jpg"
+        grid_filename = _temp_filename("frame_picker_grid", node_id, "jpg")
         grid_img.save(os.path.join(temp_dir, grid_filename), quality=85)
 
         # Structure du message d'attente
@@ -513,21 +540,18 @@ class SpaceGremlinFramePicker:
         WAITING_DATA[node_id] = wait_payload
         PromptServer.instance.send_sync("frame-picker-wait", wait_payload)
 
-        try:
-            while WAITING_SELECTIONS.get(node_id) is None:
-                time.sleep(0.1)
-        finally:
-            WAITING_DATA.pop(node_id, None)
-
-        selection = WAITING_SELECTIONS.pop(node_id, "cancel")
+        selection = _wait_for_selection(node_id)
 
         if isinstance(selection, dict) and selection.get("action") == "continue":
-            indices = selection.get("indices", [])
+            raw_indices = selection.get("indices")
+            if not isinstance(raw_indices, list):
+                raw_indices = []
+            indices = [i for i in raw_indices if type(i) is int and 0 <= i < total_frames][:max_selection]
             # Fallback de sécurité si la sélection est inférieure au minimum
             if len(indices) < min_selection:
                 indices = list(range(min(min_selection, total_frames)))
-            
-            selected_tensors = [images[i] for i in indices if i < total_frames]
+
+            selected_tensors = [images[i] for i in indices]
             out_batch = torch.stack(selected_tensors, dim=0)
             indices_str = ",".join(map(str, indices))
             
